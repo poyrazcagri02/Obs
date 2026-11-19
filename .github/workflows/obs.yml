@@ -1,0 +1,105 @@
+name: OBS Not Takip
+
+# Zamanlama GitHub'ın schedule'ı yerine harici bir cron servisiyle (ör. cron-job.org)
+# workflow_dispatch tetiklenerek yapılır; ayrıntılar README.md'de.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'discover = site yapısını keşfet, run = notları kontrol et, test = örnek Telegram mesajı'
+        type: choice
+        options: [discover, run, test]
+        default: run
+
+concurrency:
+  group: obs-not-takip
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  MODE: ${{ github.event.inputs.mode || 'run' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Python bağımlılıkları
+        run: pip install -r requirements.txt
+
+      - name: Tesseract
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr
+
+      - name: Playwright tarayıcı cache
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Chromium kur
+        run: |
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
+            playwright install-deps chromium
+          else
+            playwright install --with-deps chromium
+          fi
+
+      # Önceki notlar: her çalıştırmada benzersiz key, en sonuncusu restore-keys ile alınır.
+      # discover modunda state'e dokunulmaz.
+      - name: Önceki durumu geri yükle
+        if: env.MODE == 'run'
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: obs-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            obs-state-
+
+      - name: Botu çalıştır
+        env:
+          OBS_USER: ${{ secrets.OBS_USER }}
+          OBS_PASS: ${{ secrets.OBS_PASS }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python bot.py "$MODE"
+
+      # Başarısız çalıştırmada da kaydet ki üst üste hata sayacı korunsun.
+      - name: Durumu kaydet
+        if: always() && env.MODE == 'run' && hashFiles('state/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: obs-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Artifact'lerde ad/öğrenci no/notlar olabilir: repo public ise yüklenmez.
+      - name: Discover çıktısını yükle
+        if: always() && env.MODE == 'discover' && github.event.repository.private
+        uses: actions/upload-artifact@v4
+        with:
+          name: discover
+          path: out/discover
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Hata ekran görüntüsünü yükle
+        if: failure() && env.MODE == 'run' && github.event.repository.private
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-error
+          path: out/error
+          retention-days: 3
+          if-no-files-found: ignore
+
